@@ -1,13 +1,26 @@
 # emergy.cloud workflow contract: astro v9 (shared logic)
 # -----------------------------------------------------------------------------
-# STUB — the pipeline logic lives in the shared, versioned workflow
-#   emergy-cloud/workflows/.github/workflows/build.yml@v9        (github.com/emergy-cloud/workflows)
-# This file keeps only what has to sit in the repository: the triggers,
-# permissions, concurrency, the inputs and the ENVS fallback. A logic fix
-# reaches every repository by moving the v9 tag; a contract change (inputs,
-# triggers, file names) ships as a new stub + a new tag.
-# CONTRACT - do not rename this file, the run-name, the job id or the inputs:
-# the emergy platform dispatches and parses them.
+# emergy.cloud CI/CD reference - Build (Astro)
+#
+# One build per commit: installs, builds, and uploads the site to the account's
+# artifact bucket keyed by commit SHA, then dispatches the Deploy workflow for
+# the environment the git event targets. The same file works for every Astro
+# template - SSR extras (Lambda bundle) are detected at runtime, not hardcoded.
+#
+# Repository variables maintained by the emergy platform:
+#   PROJECT_ID, AWS_REGION, AWS_ACCOUNT_ID, AWS_INFRA_ROLE_TO_ASSUME, ENVS
+# Optional overrides you may set yourself:
+#   NODE_VERSION (default 24), ARTIFACT_BUCKET (default <PROJECT_ID>-artifacts),
+#   AWS_BUILD_ROLE_TO_ASSUME (defaults to the infra role)
+#
+# ENVS is the comma-separated list of this project's enabled environments.
+# Events that target an environment not present in ENVS build normally but
+# skip the deploy dispatch.
+#
+# CONTRACT - the platform tracks this pipeline by convention. Do not rename
+# this file (.github/workflows/build.yml) or the deploy dispatch inputs
+# (environment, sha, deploy_all, deploy_environments); the platform dispatches
+# and parses them.
 # -----------------------------------------------------------------------------
 # REUSABLE: every repository calls this file through a thin stub —
 #   uses: emergy-cloud/workflows/.github/workflows/build.yml@v9
@@ -39,9 +52,242 @@ on:
 
 jobs:
   build:
-    uses: emergy-cloud/workflows/.github/workflows/build.yml@v9
-    with:
-      envs: ${{ inputs.envs || vars.ENVS || 'dev,staging,prod' }}
-      deploy_all: ${{ inputs.deploy_all == true }}
-      deploy_environments: ${{ inputs.deploy_environments || '' }}
-    secrets: inherit
+    # Skip the very first push (the commit that creates the repo from the
+    # template) - the AWS account is not provisioned yet at that point.
+    if: ${{ !(github.event_name == 'push' && github.run_number == 1) }}
+    name: Build & Upload Artifact
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      PROJECT_ID: ${{ vars.PROJECT_ID }}
+      ROLE_TO_ASSUME: ${{ vars.AWS_BUILD_ROLE_TO_ASSUME || vars.AWS_INFRA_ROLE_TO_ASSUME }}
+      WEBSITE_DIR: 'website'
+      # Use the PR head SHA for PR events; otherwise the push SHA. This is the
+      # artifact key the Deploy workflow receives.
+      COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET || format('{0}-artifacts', vars.PROJECT_ID) }}
+      NODE_VERSION: ${{ vars.NODE_VERSION || '24' }}
+      ENVS: ${{ inputs.envs || vars.ENVS || 'dev,staging,prod' }}
+      # Optional: report this build's result as a commit status on the
+      # Forgejo copy of the repo (FORGEJO_REPO = "org/repo" on
+      # git.emergy.cloud, FORGEJO_STATUS_TOKEN = a write:repository token of a
+      # status-only bot) so a merge gate on Forgejo (dvk merge) sees GitHub CI.
+      FORGEJO_URL: ${{ vars.FORGEJO_URL || 'https://git.emergy.cloud' }}
+      FORGEJO_REPO: ${{ vars.FORGEJO_REPO }}
+      FORGEJO_STATUS_TOKEN: ${{ secrets.FORGEJO_STATUS_TOKEN }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # ---- Build & upload (every event builds; main's merge commit included) ----
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The same workflow serves every Astro template:
+      #   pm   - pnpm when a pnpm lockfile is present, npm otherwise
+      #   ssr  - templates with a "prepare:aws" script ship a Lambda server
+      #          bundle (server.zip) next to the static assets
+      #   worker - projects with a "package:worker" script ship worker.zip
+      - name: Detect project shape
+        id: shape
+        run: |
+          set -euo pipefail
+          PM=npm; LOCKFILE=package-lock.json
+          if [ -f "${WEBSITE_DIR}/pnpm-lock.yaml" ]; then PM=pnpm; LOCKFILE=pnpm-lock.yaml; fi
+          # setup-node's cache resolves cache-dependency-path against the
+          # checkout; a repo without a committed lockfile would fail the whole
+          # job there ("Some specified paths were not resolved"), so run
+          # uncached instead and surface the real problem.
+          CACHE="$PM"
+          if [ ! -f "${WEBSITE_DIR}/${LOCKFILE}" ]; then
+            CACHE=''
+            echo "::warning::${WEBSITE_DIR}/${LOCKFILE} is not committed - dependency caching disabled; commit the lockfile to fix this"
+          fi
+          SSR=false
+          if jq -e '.scripts["prepare:aws"]' "${WEBSITE_DIR}/package.json" >/dev/null 2>&1; then SSR=true; fi
+          WORKER=false
+          if jq -e '.scripts["package:worker"]' "${WEBSITE_DIR}/package.json" >/dev/null 2>&1; then WORKER=true; fi
+          # pnpm/action-setup reads the pnpm version from the "packageManager"
+          # field; repos without the field get an explicit fallback instead of
+          # a "No pnpm version is specified" failure.
+          PNPM_VERSION=''
+          if [ "$PM" = pnpm ] && ! jq -e '.packageManager? | strings | startswith("pnpm@")' "${WEBSITE_DIR}/package.json" >/dev/null 2>&1; then
+            PNPM_VERSION=10
+            echo "No pnpm \"packageManager\" entry in package.json - defaulting to pnpm ${PNPM_VERSION}"
+          fi
+          echo "Detected: pm=$PM ssr=$SSR worker=$WORKER"
+          { echo "pm=$PM"; echo "lockfile=$LOCKFILE"; echo "cache=$CACHE"; echo "ssr=$SSR"; echo "worker=$WORKER"; echo "pnpm_version=$PNPM_VERSION"; } >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        id: aws_credentials
+        if: >
+          !(github.event_name == 'pull_request' && github.event.action == 'closed')
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # AWS answers every refused OIDC assume with the same opaque string,
+      # whatever the cause - wrong role, missing provider, unmatched trust. The
+      # token is the only thing that can say which, so print its claims (never
+      # the token) when the assume fails. Compare `sub` against the deploy
+      # role's trust condition; they must match exactly.
+      - name: Explain OIDC failure
+        if: failure() && steps.aws_credentials.conclusion == 'failure'
+        working-directory: .
+        run: |
+          echo "::error::${ROLE_TO_ASSUME} did not trust this workflow's OIDC token"
+          T=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          P=$(echo "$T" | cut -d. -f2 | tr '_-' '/+')
+          # A JWT payload is unpadded base64url - base64 needs the "=" back,
+          # or it decodes the claims and still exits "base64: invalid input".
+          case $(( ${#P} % 4 )) in 2) P="$P==" ;; 3) P="$P=" ;; esac
+          printf '%s' "$P" | base64 -d | jq '{sub,aud,repository}'
+
+      # pnpm version comes from the "packageManager" field in the website's
+      # package.json - package_json_file matters: the action defaults to the
+      # repo-root package.json, which does not exist here. The shape step
+      # supplies a fallback version when the field is absent (an empty version
+      # input means "read packageManager").
+      - name: Setup pnpm
+        if: >
+          steps.shape.outputs.pm == 'pnpm' &&
+          !(github.event_name == 'pull_request' && github.event.action == 'closed')
+        uses: pnpm/action-setup@v6
+        with:
+          version: ${{ steps.shape.outputs.pnpm_version }}
+          package_json_file: ${{ env.WEBSITE_DIR }}/package.json
+
+      - name: Setup Node
+        if: >
+          !(github.event_name == 'pull_request' && github.event.action == 'closed')
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: ${{ steps.shape.outputs.cache }}
+          cache-dependency-path: ${{ env.WEBSITE_DIR }}/${{ steps.shape.outputs.lockfile }}
+
+      - name: Install dependencies
+        working-directory: ${{ env.WEBSITE_DIR }}
+        if: >
+          !(github.event_name == 'pull_request' && github.event.action == 'closed')
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.shape.outputs.pm }}" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      # Non-secret build-time config: dotenv-style lines from the BUILD_ENV
+      # repository variable, exported before the build (e.g. Astro PUBLIC_*
+      # values inlined into the client bundle). Secrets do NOT belong here -
+      # runtime config loads from the per-env secret at Lambda cold start.
+      - name: Export build environment (BUILD_ENV repository variable)
+        if: >
+          vars.BUILD_ENV != '' &&
+          !(github.event_name == 'pull_request' && github.event.action == 'closed')
+        env:
+          BUILD_ENV: ${{ vars.BUILD_ENV }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$BUILD_ENV" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: ${{ env.WEBSITE_DIR }}
+        if: >
+          !(github.event_name == 'pull_request' && github.event.action == 'closed')
+        run: |
+          set -euo pipefail
+          "${{ steps.shape.outputs.pm }}" run build
+          # version.txt carries the artifact key so a deployed site can be
+          # traced back to its commit.
+          echo "${COMMIT_SHA}" > dist/version.txt
+          if [ "${{ steps.shape.outputs.ssr }}" = "true" ]; then
+            "${{ steps.shape.outputs.pm }}" run prepare:aws
+            (cd ./ssr_dist && zip -r ../server.zip .)
+          fi
+          if [ "${{ steps.shape.outputs.worker }}" = "true" ]; then
+            "${{ steps.shape.outputs.pm }}" run package:worker
+          fi
+
+      - name: Upload to S3 (artifact bucket, keyed by commit SHA)
+        working-directory: ${{ env.WEBSITE_DIR }}
+        if: >
+          !(github.event_name == 'pull_request' && github.event.action == 'closed')
+        run: |
+          set -euo pipefail
+          # SSR builds keep the raw server bundle out of the public artifact;
+          # it ships separately as server.zip. No-op for static builds.
+          rm -rf ./dist/server
+          aws s3 cp ./dist/ "s3://${ARTIFACT_BUCKET}/builds/${COMMIT_SHA}/" --recursive
+          if [ -f ./server.zip ]; then
+            aws s3 cp ./server.zip "s3://${ARTIFACT_BUCKET}/builds/${COMMIT_SHA}/"
+          fi
+          if [ -f ./worker.zip ]; then
+            aws s3 cp ./worker.zip "s3://${ARTIFACT_BUCKET}/builds/${COMMIT_SHA}/"
+          fi
+
+      # ---- Dispatch Deploy ----
+      # The pipeline maps git events onto the environment vocabulary:
+      #   push to a feature branch  -> dev
+      #   PR opened/updated to main -> staging
+      #   push to main (a merge)    -> prod (built from the merge commit, whichever host merged it)
+      #   manual run                -> selected envs, every enabled env via deploy_all, or none
+      # A target that is not in ENVS is skipped - so projects without a
+      # given environment simply never deploy to it.
+      - name: Dispatch Deploy for this event
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SELECTED_ENVS: ${{ inputs.deploy_environments }}
+        run: |
+          set -euo pipefail
+          TARGETS=()
+          REF="${{ github.ref_name }}"
+          case "${{ github.event_name }}" in
+            push)
+              if [[ "${{ github.ref_name }}" == "main" ]]; then TARGETS=(prod); REF="main"; else TARGETS=(dev); fi
+              ;;
+            pull_request)
+              if [[ "${{ github.event.pull_request.base.ref }}" == "main" ]]; then
+                TARGETS=(staging)
+                REF="${{ github.event.pull_request.base.ref }}"
+              fi
+              ;;
+            workflow_dispatch)
+              if [[ "${{ inputs.deploy_all }}" == "true" ]]; then
+                IFS=',' read -ra TARGETS <<< "${ENVS}"
+              elif [[ -n "${SELECTED_ENVS}" ]]; then
+                IFS=',' read -ra TARGETS <<< "${SELECTED_ENVS}"
+              fi
+              ;;
+          esac
+          for ENV in "${TARGETS[@]:-}"; do
+            [ -n "$ENV" ] || continue
+            if [[ ",${ENVS}," != *",${ENV},"* ]]; then
+              echo "$ENV is not an enabled environment (ENVS=${ENVS}) - skipping deploy"
+              continue
+            fi
+            echo "Dispatching Deploy: env=$ENV sha=${COMMIT_SHA} ref=$REF"
+            gh api \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${{ github.repository }}/actions/workflows/deploy.yml/dispatches" \
+              -f ref="$REF" \
+              -f inputs[environment]="$ENV" \
+              -f inputs[sha]="${COMMIT_SHA}"
+          done
+
+      # ---- Forgejo commit status (optional, see FORGEJO_* above) ----
+      - name: Report the result to Forgejo
+        if: ${{ always() && env.FORGEJO_REPO != '' && env.FORGEJO_STATUS_TOKEN != '' }}
+        run: |
+          STATE=success; [ "${{ job.status }}" = "success" ] || STATE=failure
+          curl -fsS --max-time 20 -X POST \
+            -H "Authorization: token ${FORGEJO_STATUS_TOKEN}" -H 'Content-Type: application/json' \
+            "${FORGEJO_URL%/}/api/v1/repos/${FORGEJO_REPO}/statuses/${COMMIT_SHA}" \
+            -d "{\"state\":\"${STATE}\",\"context\":\"github/build\",\"description\":\"GitHub Actions build (${{ github.event_name }})\",\"target_url\":\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            || echo "::warning::could not report the status to Forgejo (${FORGEJO_REPO})"
