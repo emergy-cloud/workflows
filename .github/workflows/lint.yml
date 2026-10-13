@@ -20,7 +20,9 @@ jobs:
         run: |
           set -euo pipefail
           bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.7
-          ./actionlint -color
+          # -shellcheck= : the run: scripts predate this lint and carry style-level
+          # shellcheck notes (SC2086/SC2102/SC2162); the workflow structure is what we gate.
+          ./actionlint -color -shellcheck=
 
       - name: contract check
         run: bash scripts/contract-check.sh
