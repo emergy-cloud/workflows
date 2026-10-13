@@ -1,0 +1,240 @@
+# emergy.cloud workflow contract: astro v9 (shared logic)
+# -----------------------------------------------------------------------------
+# emergy.cloud CI/CD reference - Deploy (Astro)
+#
+# Promotes an already-built artifact (uploaded by build.yml under
+# builds/<sha>/ in the artifact bucket) to one environment: syncs the static
+# assets to that environment's website bucket, updates the SSR Lambda when the
+# artifact ships a server bundle, updates an optional control-plane worker,
+# and invalidates the CloudFront cache. The same file works for every Astro
+# template - artifacts are detected, not hardcoded.
+#
+# Repository variables maintained by the emergy platform:
+#   PROJECT_ID, AWS_REGION, AWS_ACCOUNT_ID, AWS_INFRA_ROLE_TO_ASSUME, ENVS
+# Optional overrides you may set yourself:
+#   ARTIFACT_BUCKET (default <PROJECT_ID>-artifacts),
+#   AWS_DEPLOY_ROLE_TO_ASSUME (defaults to the infra role)
+#
+# The target website bucket follows the platform convention
+# <PROJECT_ID>-<environment>-website (created by update-infrastructure.yml).
+#
+# CONTRACT - do not rename this file (.github/workflows/deploy.yml), the
+# run-name, the job name, or the inputs (environment, sha): the emergy
+# platform dispatches this workflow and parses those names to link runs to
+# environments.
+# -----------------------------------------------------------------------------
+# REUSABLE: every repository calls this file through a thin stub —
+#   uses: emergy-cloud/workflows/.github/workflows/deploy.yml@v9
+#   secrets: inherit
+# Triggers, permissions and concurrency live in the calling stub; vars.* and
+# secrets.* resolve in the CALLING repository, and the OIDC token keeps the
+# caller's identity, so the AWS trust policies do not change.
+# -----------------------------------------------------------------------------
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      envs:
+        description: "Comma-separated enabled environments — the stub passes its ENVS fallback so a repository without the variable still behaves like its copy"
+        required: false
+        type: string
+        default: ""
+      environment:
+        description: "Environment to deploy to - one of the enabled environments (the ENVS repository variable)"
+        required: true
+        type: string
+      sha:
+        description: "Commit SHA to deploy (artifact key)"
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.environment }} from sha ${{ inputs.sha }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      PROJECT_ID: ${{ vars.PROJECT_ID }}
+      ROLE_TO_ASSUME: ${{ vars.AWS_DEPLOY_ROLE_TO_ASSUME || vars.AWS_INFRA_ROLE_TO_ASSUME }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+
+      # The artifact source bucket (MUST match where build.yml uploads)
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET || format('{0}-artifacts', vars.PROJECT_ID) }}
+
+      # Enabled environments - maintained by the platform
+      ENVS: ${{ inputs.envs || vars.ENVS || 'dev,staging,prod' }}
+
+      # Inputs
+      COMMIT_SHA: ${{ inputs.sha }}
+      ENV: ${{ inputs.environment }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # Free-text input + explicit check: the file needs no edit when
+      # environments are enabled or disabled later.
+      - name: Validate environment
+        run: |
+          set -euo pipefail
+          if [[ ",${ENVS}," != *",${ENV},"* ]]; then
+            echo "::error::'${ENV}' is not an enabled environment (ENVS=${ENVS})"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        id: aws_credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # AWS answers every refused OIDC assume with the same opaque string,
+      # whatever the cause - wrong role, missing provider, unmatched trust. The
+      # token is the only thing that can say which, so print its claims (never
+      # the token) when the assume fails. Compare `sub` against the deploy
+      # role's trust condition; they must match exactly.
+      - name: Explain OIDC failure
+        if: failure() && steps.aws_credentials.conclusion == 'failure'
+        working-directory: .
+        run: |
+          echo "::error::${ROLE_TO_ASSUME} did not trust this workflow's OIDC token"
+          T=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          P=$(echo "$T" | cut -d. -f2 | tr '_-' '/+')
+          # A JWT payload is unpadded base64url - base64 needs the "=" back,
+          # or it decodes the claims and still exits "base64: invalid input".
+          case $(( ${#P} % 4 )) in 2) P="$P==" ;; 3) P="$P=" ;; esac
+          printf '%s' "$P" | base64 -d | jq '{sub,aud,repository}'
+
+      - name: Verify artifact exists
+        run: |
+          set -euo pipefail
+          SRC_PREFIX="builds/${COMMIT_SHA}/"
+          echo "Checking s3://${ARTIFACT_BUCKET}/${SRC_PREFIX}"
+          COUNT=$(aws s3api list-objects-v2 \
+                    --bucket "${ARTIFACT_BUCKET}" \
+                    --prefix "${SRC_PREFIX}" \
+                    --max-keys 1 \
+                    --query 'KeyCount' \
+                    --output text || echo 0)
+          if [ "${COUNT}" = "0" ]; then
+            echo "::error::Artifact not found at s3://${ARTIFACT_BUCKET}/${SRC_PREFIX}"
+            echo "Ensure build.yml uploaded this SHA to the same ARTIFACT_BUCKET."
+            exit 1
+          fi
+
+      # SSR artifacts keep their browser assets under client/ and ship a
+      # server.zip Lambda bundle; static artifacts are flat. Inspect the
+      # artifact instead of assuming a template variant.
+      - name: Detect artifact layout
+        id: layout
+        run: |
+          set -euo pipefail
+          PREFIX=""
+          CLIENT_COUNT=$(aws s3api list-objects-v2 \
+                           --bucket "${ARTIFACT_BUCKET}" \
+                           --prefix "builds/${COMMIT_SHA}/client/" \
+                           --max-keys 1 \
+                           --query 'KeyCount' \
+                           --output text || echo 0)
+          if [ "${CLIENT_COUNT}" != "0" ]; then PREFIX="client/"; fi
+          SSR=false
+          if aws s3api head-object \
+               --bucket "${ARTIFACT_BUCKET}" \
+               --key "builds/${COMMIT_SHA}/server.zip" >/dev/null 2>&1; then
+            SSR=true
+          fi
+          WORKER=false
+          if aws s3api head-object \
+               --bucket "${ARTIFACT_BUCKET}" \
+               --key "builds/${COMMIT_SHA}/worker.zip" >/dev/null 2>&1; then
+            WORKER=true
+          fi
+          echo "Detected: assets under '${PREFIX:-.}', ssr=${SSR}, worker=${WORKER}"
+          { echo "prefix=$PREFIX"; echo "ssr=$SSR"; echo "worker=$WORKER"; } >> "$GITHUB_OUTPUT"
+
+      - name: Sync artifact to the environment website bucket
+        run: |
+          set -euo pipefail
+          SRC="s3://${ARTIFACT_BUCKET}/builds/${COMMIT_SHA}/${{ steps.layout.outputs.prefix }}"
+          # Platform convention: one website bucket per environment.
+          TARGET="s3://${PROJECT_ID}-${ENV}-website"
+          echo "Copying ${SRC} -> ${TARGET}"
+          aws s3 sync "${SRC}" "${TARGET}/" --only-show-errors --delete
+
+          # Optional robots swapping: upload <environment>_robots.txt variants
+          # from your build and the matching one becomes robots.txt here.
+          aws s3 cp "${SRC}${ENV}_robots.txt" "${TARGET}/robots.txt" --only-show-errors || true
+          IFS=',' read -ra ENV_LIST <<< "${ENVS}"
+          for E in "${ENV_LIST[@]}"; do
+            aws s3 rm "${TARGET}/${E}_robots.txt" --only-show-errors || true
+          done
+
+      - name: Update SSR Lambda
+        if: steps.layout.outputs.ssr == 'true'
+        run: |
+          set -euo pipefail
+          aws lambda update-function-code \
+            --function-name "${PROJECT_ID}_${ENV}_website_ssr" \
+            --s3-bucket "${ARTIFACT_BUCKET}" \
+            --s3-key "builds/${COMMIT_SHA}/server.zip" \
+            --publish
+
+      - name: Update control-plane worker Lambda
+        if: steps.layout.outputs.worker == 'true'
+        run: |
+          set -euo pipefail
+          FUNCTION_NAME="${PROJECT_ID}-worker"
+          UPDATED=false
+          for ATTEMPT in 1 2 3 4 5 6; do
+            if UPDATE_OUTPUT=$(aws lambda update-function-code \
+              --function-name "${FUNCTION_NAME}" \
+              --s3-bucket "${ARTIFACT_BUCKET}" \
+              --s3-key "builds/${COMMIT_SHA}/worker.zip" \
+              --publish 2>&1); then
+              echo "${UPDATE_OUTPUT}"
+              UPDATED=true
+              break
+            fi
+            if [[ "${UPDATE_OUTPUT}" != *"ResourceConflictException"* ]]; then
+              echo "${UPDATE_OUTPUT}" >&2
+              exit 1
+            fi
+            echo "::warning::Worker Lambda update busy; waiting before retry ${ATTEMPT}/6"
+            aws lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
+          done
+          if [ "${UPDATED}" != "true" ]; then
+            echo "::error::Worker Lambda remained busy after 6 attempts"
+            exit 1
+          fi
+          aws lambda wait function-updated-v2 --function-name "${FUNCTION_NAME}"
+
+      - name: Invalidate CloudFront cache (distribution tagged env + projectId)
+        run: |
+          set -euo pipefail
+          CLOUDFRONT_DISTRIBUTION_ID=$(
+            aws cloudfront list-distributions \
+              --query "DistributionList.Items[].Id" \
+              --output text | tr '\t' '\n' | while read distid; do
+                count=$(aws cloudfront list-tags-for-resource \
+                  --resource "arn:aws:cloudfront::${AWS_ACCOUNT_ID}:distribution/${distid}" \
+                  --query "length(Tags.Items[? (Key=='env' && Value=='${ENV}') || (Key=='projectId' && Value=='${PROJECT_ID}')])" \
+                  --output text)
+                # Require BOTH tags (env=$ENV and projectId=$PROJECT_ID)
+                if [ "$count" -eq 2 ]; then
+                  echo "$distid"; break
+                fi
+              done
+          )
+          if [ -z "$CLOUDFRONT_DISTRIBUTION_ID" ]; then
+            echo "::error::No CloudFront distribution tagged env=${ENV} and projectId=${PROJECT_ID} found."
+            exit 1
+          fi
+          echo "Using distribution: $CLOUDFRONT_DISTRIBUTION_ID"
+          aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "/*"

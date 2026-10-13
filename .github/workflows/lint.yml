@@ -1,0 +1,26 @@
+# Self-check of this repository: actionlint over every workflow file + the
+# platform-contract strings the emergy webhook/dispatcher rely on. The four
+# shared workflows are `workflow_call` only, so a push here never runs them.
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.7
+          ./actionlint -color
+
+      - name: contract check
+        run: bash scripts/contract-check.sh

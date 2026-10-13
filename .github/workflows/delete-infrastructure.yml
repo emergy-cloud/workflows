@@ -1,0 +1,143 @@
+# emergy.cloud workflow contract: astro v9 (shared logic)
+# -----------------------------------------------------------------------------
+# emergy.cloud CI/CD reference - Delete Infrastructure (Astro)
+#
+# Destroys everything the terraform root manages in the project's AWS account
+# (website buckets, CloudFront distributions, SSR Lambda when present).
+# Manual-only and guarded by an explicit confirmation input. The emergy
+# platform dispatches it (with confirm=confirm) when a project is deleted.
+#
+# Repository variables maintained by the emergy platform:
+#   PROJECT_ID, AWS_REGION, AWS_ACCOUNT_ID, AWS_INFRA_ROLE_TO_ASSUME,
+#   TF_BACKEND_BUCKET, TF_STATE_KEY_PREFIX,
+#   HOSTNAME_<ENV>, AWS_WEBSITE_ACM_ARN_<ENV>,
+#   AWS_WEBSITE_ACM_NAME_<ENV> (environment custom-domain configuration)
+# Optional overrides you may set yourself:
+#   TF_VERSION, INFRA_DIR
+#
+# CONTRACT - do not rename this file
+# (.github/workflows/delete-infrastructure.yml) or the confirm input: the
+# emergy platform matches destroy runs by that path and passes that input.
+# -----------------------------------------------------------------------------
+# REUSABLE: every repository calls this file through a thin stub —
+#   uses: emergy-cloud/workflows/.github/workflows/delete-infrastructure.yml@v9
+#   secrets: inherit
+# Triggers, permissions and concurrency live in the calling stub; vars.* and
+# secrets.* resolve in the CALLING repository, and the OIDC token keeps the
+# caller's identity, so the AWS trust policies do not change.
+# -----------------------------------------------------------------------------
+name: Delete Infrastructure
+
+on:
+  workflow_call:
+    inputs:
+      confirm:
+        description: "Type 'confirm' to proceed with terraform destroy"
+        required: true
+        type: string
+        default: ""
+
+jobs:
+  delete:
+    # Only run if the caller typed exactly 'confirm'
+    if: ${{ inputs.confirm == 'confirm' }}
+
+    runs-on: ubuntu-latest
+
+    env:
+      INFRA_DIR: ${{ vars.INFRA_DIR || 'infrastructure' }}
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+      PROJECT_ID: ${{ vars.PROJECT_ID }}
+      TF_VERSION: ${{ vars.TF_VERSION || '1.15.8' }}
+      TF_BACKEND_BUCKET: ${{ vars.TF_BACKEND_BUCKET }}
+      TF_STATE_KEY_PREFIX: ${{ vars.TF_STATE_KEY_PREFIX || 'default-project' }}
+      ROLE_TO_ASSUME: ${{ vars.AWS_INFRA_ROLE_TO_ASSUME }}
+
+      # Pass-thru TF vars the terraform root uses
+      TF_VAR_aws_account_number: ${{ vars.AWS_ACCOUNT_ID }}
+      TF_VAR_project_id: ${{ vars.PROJECT_ID }}
+      TF_VAR_base_domain: ${{ vars.AWS_WEBSITE_ACM_NAME }}
+      TF_VAR_aws_website_acm_arn: ${{ vars.AWS_WEBSITE_ACM_ARN }}
+      TF_VAR_base_domain_dev: ${{ vars.AWS_WEBSITE_ACM_NAME_DEV }}
+      TF_VAR_base_domain_staging: ${{ vars.AWS_WEBSITE_ACM_NAME_STAGING }}
+      TF_VAR_base_domain_prod: ${{ vars.AWS_WEBSITE_ACM_NAME_PROD }}
+      TF_VAR_aws_website_acm_arn_dev: ${{ vars.AWS_WEBSITE_ACM_ARN_DEV }}
+      TF_VAR_aws_website_acm_arn_staging: ${{ vars.AWS_WEBSITE_ACM_ARN_STAGING }}
+      TF_VAR_aws_website_acm_arn_prod: ${{ vars.AWS_WEBSITE_ACM_ARN_PROD }}
+      TF_VAR_hostname_dev: ${{ vars.HOSTNAME_DEV }}
+      TF_VAR_hostname_staging: ${{ vars.HOSTNAME_STAGING }}
+      TF_VAR_hostname_prod: ${{ vars.HOSTNAME_PROD }}
+
+    permissions:
+      id-token: write
+      contents: read
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ env.INFRA_DIR }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Configure AWS credentials (OIDC)
+        id: aws_credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ env.ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # AWS answers every refused OIDC assume with the same opaque string,
+      # whatever the cause - wrong role, missing provider, unmatched trust. The
+      # token is the only thing that can say which, so print its claims (never
+      # the token) when the assume fails. Compare `sub` against the deploy
+      # role's trust condition; they must match exactly.
+      - name: Explain OIDC failure
+        if: failure() && steps.aws_credentials.conclusion == 'failure'
+        working-directory: .
+        run: |
+          echo "::error::${ROLE_TO_ASSUME} did not trust this workflow's OIDC token"
+          T=$(curl -sH "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+          P=$(echo "$T" | cut -d. -f2 | tr '_-' '/+')
+          # A JWT payload is unpadded base64url - base64 needs the "=" back,
+          # or it decodes the claims and still exits "base64: invalid input".
+          case $(( ${#P} % 4 )) in 2) P="$P==" ;; 3) P="$P=" ;; esac
+          printf '%s' "$P" | base64 -d | jq '{sub,aud,repository}'
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # State locking is S3-native (a .tflock object next to the state);
+      # the DynamoDB lock table is deprecated in Terraform and unused here.
+      - name: Terraform Init (S3 backend with S3-native locking)
+        run: |
+          set -euo pipefail
+          # SSR layouts: terraform reads the build artifacts even on destroy,
+          # and a fresh checkout has none of them (both are gitignored). Two
+          # placeholders keep the refresh from failing; nothing is uploaded
+          # because every resource is on its way out.
+          # 1. the Lambda layer archive the layer resource hashes.
+          if [ -d lambda_layer ]; then
+            echo "delete" > delete.txt
+            zip -j lambda_layer/lambda_layer_website_ssr.zip delete.txt
+          fi
+          # 2. the SSR bundle directory data.archive_file zips - without it
+          #    destroy stops at "could not archive missing directory".
+          if grep -qs ssr_dist ./*.tf; then
+            mkdir -p ../website/ssr_dist
+            echo "delete" > ../website/ssr_dist/delete.txt
+          fi
+          rm -rf .terraform
+          terraform init \
+            -backend-config="bucket=${TF_BACKEND_BUCKET}" \
+            -backend-config="key=${TF_STATE_KEY_PREFIX}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="use_lockfile=true"
+
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
