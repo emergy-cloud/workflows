@@ -1,6 +1,9 @@
-# Self-check of this repository: actionlint over every workflow file + the
-# platform-contract strings the emergy webhook/dispatcher rely on. The four
-# shared workflows are `workflow_call` only, so a push here never runs them.
+# Self-check of this repository: actionlint over every workflow file and the
+# stub templates, shellcheck over the scripts, the platform-contract strings
+# the emergy webhook/dispatcher rely on (scripts/contract-check.sh, which also
+# rejects self-calling logic files), and the tests of that check and of the
+# installer. The four shared workflows are `workflow_call` only, so a push
+# here never runs them.
 name: Lint
 
 on:
@@ -20,9 +23,22 @@ jobs:
         run: |
           set -euo pipefail
           bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) 1.7.7
-          # -shellcheck= : the run: scripts predate this lint and carry style-level
-          # shellcheck notes (SC2086/SC2102/SC2162); the workflow structure is what we gate.
+          # -shellcheck= : the older run: scripts predate this lint and carry
+          # style-level notes (SC2086/SC2162); the workflow structure is what
+          # we gate here. The scripts below get the full shellcheck pass.
           ./actionlint -color -shellcheck=
+          ./actionlint -color -shellcheck= stubs/*/*.yml
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh tests/*.sh
 
       - name: contract check
         run: bash scripts/contract-check.sh
+
+      - name: contract check tests (self-calling fixtures must fail)
+        run: bash tests/contract-check.test.sh
+
+      - name: install.sh tests (reference and vendored output, actionlinted)
+        env:
+          ACTIONLINT: ${{ github.workspace }}/actionlint
+        run: bash tests/install.test.sh
