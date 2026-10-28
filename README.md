@@ -193,13 +193,17 @@ Synchronize now on Forgejo.
 [actionlint](https://github.com/rhysd/actionlint) on `.github/workflows` and
 `stubs/`, shellcheck on `scripts/` and `tests/`, `scripts/contract-check.sh`,
 `tests/contract-check.test.sh` (broken copies of the tree, including the
-d372cff self-calling `build.yml` in `tests/fixtures/`, must fail) and
-`tests/install.test.sh` (both modes, actionlinted). Locally:
+d372cff self-calling `build.yml` in `tests/fixtures/`, must fail),
+`tests/prod-path.test.sh` (runs the real dispatch and promotion scripts of
+`build.yml` and `deploy.yml` against a fake `gh`, one case per event and
+guard condition) and `tests/install.test.sh` (both modes, actionlinted).
+Locally:
 
 ```sh
 actionlint -shellcheck= && actionlint -shellcheck= stubs/*/*.yml
 shellcheck scripts/*.sh tests/*.sh
-bash scripts/contract-check.sh && bash tests/contract-check.test.sh && bash tests/install.test.sh
+bash scripts/contract-check.sh && bash tests/contract-check.test.sh
+bash tests/prod-path.test.sh && bash tests/install.test.sh
 ```
 
 ## Where this repository lives

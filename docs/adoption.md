@@ -83,4 +83,4 @@ template's stubs name `emergy-cloud/workflows`.
 
 Run the same command with the new ref (`--ref v10.1.0`, `--ref v11`), review `git diff`, commit. A new major also
 brings new stubs (re-read the README for what changed). www.emergy.cloud additionally re-syncs its served stubs:
-`WORKFLOWS_DIR=/repos/workflows WORKFLOWS_REF=v10.0.0 pnpm --dir website workflows:sync`.
+`cd website && WORKFLOWS_DIR=/repos/workflows WORKFLOWS_REF=v10.0.0 npm run workflows:sync`.

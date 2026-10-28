@@ -1,8 +1,8 @@
 # Self-check of this repository: actionlint over every workflow file and the
 # stub templates, shellcheck over the scripts, the platform-contract strings
 # the emergy webhook/dispatcher rely on (scripts/contract-check.sh, which also
-# rejects self-calling logic files), and the tests of that check and of the
-# installer. The four shared workflows are `workflow_call` only, so a push
+# rejects self-calling logic files), and the tests of that check, of the
+# prod path scripts and of the installer. The four shared workflows are `workflow_call` only, so a push
 # here never runs them.
 name: Lint
 
@@ -37,6 +37,9 @@ jobs:
 
       - name: contract check tests (self-calling fixtures must fail)
         run: bash tests/contract-check.test.sh
+
+      - name: prod path tests (the v10 dispatch and promotion scripts, fake gh)
+        run: bash tests/prod-path.test.sh
 
       - name: install.sh tests (reference and vendored output, actionlinted)
         env:
