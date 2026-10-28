@@ -1,9 +1,9 @@
 # Self-check of this repository: actionlint over every workflow file and the
 # stub templates, shellcheck over the scripts, the platform-contract strings
 # the emergy webhook/dispatcher rely on (scripts/contract-check.sh, which also
-# rejects self-calling logic files), and the tests of that check, of the
-# prod path scripts and of the installer. The four shared workflows are `workflow_call` only, so a push
-# here never runs them.
+# rejects self-calling logic files), and the tests of that check, of the prod
+# path scripts and of the installer. The four shared workflows are
+# `workflow_call` only, so a push here never runs them.
 name: Lint
 
 on:
