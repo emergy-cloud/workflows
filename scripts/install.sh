@@ -177,29 +177,35 @@ $hits"
 fi
 
 # ---- write -------------------------------------------------------------------
-echo "emergy.cloud CI install: mode=$MODE ref=$REF contract=$STACK v$CONTRACT"
-echo "  source: $THIS_REPO@$SRC_SHA ($SRC_NOTE)"
-echo "  envs fallback: $ENVS (from $ENVS_SRC)"
-echo "  target: $TARGET_ABS"
+# Copy every file first and report afterwards, so a closed stdout (a pipe into
+# head) can never leave a half-installed set.
 mkdir -p "$TARGET_ABS/.github/workflows"
+REPORT=""
+note() { REPORT="$REPORT$1
+"; }
 for f in $FILES; do
   cp "$STAGE/out/$f.yml" "$TARGET_ABS/.github/workflows/$f.yml"
   if [ "$MODE" = ref ]; then
-    echo "wrote .github/workflows/$f.yml (stub, calls $THIS_REPO/.github/workflows/$f.yml@$REF)"
+    note "wrote .github/workflows/$f.yml (stub, calls $THIS_REPO/.github/workflows/$f.yml@$REF)"
   else
-    echo "wrote .github/workflows/$f.yml (stub, calls ./.github/workflows/vendored-$f.yml)"
+    note "wrote .github/workflows/$f.yml (stub, calls ./.github/workflows/vendored-$f.yml)"
   fi
 done
 if [ "$MODE" = vendor ]; then
   for f in $FILES; do
     cp "$STAGE/out/vendored-$f.yml" "$TARGET_ABS/.github/workflows/vendored-$f.yml"
-    echo "wrote .github/workflows/vendored-$f.yml (logic vendored from $THIS_REPO@$REF, $SRC_SHA)"
+    note "wrote .github/workflows/vendored-$f.yml (logic vendored from $THIS_REPO@$REF, $SRC_SHA)"
   done
 else
   for f in $FILES; do
     if [ -f "$TARGET_ABS/.github/workflows/vendored-$f.yml" ]; then
-      echo "note: .github/workflows/vendored-$f.yml is left in place but no longer called; delete it in the same commit"
+      note "note: .github/workflows/vendored-$f.yml is left in place but no longer called; delete it in the same commit"
     fi
   done
 fi
+echo "emergy.cloud CI install: mode=$MODE ref=$REF contract=$STACK v$CONTRACT"
+echo "  source: $THIS_REPO@$SRC_SHA ($SRC_NOTE)"
+echo "  envs fallback: $ENVS (from $ENVS_SRC)"
+echo "  target: $TARGET_ABS"
+printf '%s' "$REPORT"
 echo "Review with: git -C $TARGET_ABS diff -- .github/workflows; then commit."

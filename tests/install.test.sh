@@ -83,6 +83,12 @@ check "ref mode v10 on an empty target succeeds" run_to "$TMP/ref-major.out" --m
 check "ref mode v10: stubs call @v10" contains "$d/.github/workflows/deploy.yml" "uses: emergy-cloud/workflows/.github/workflows/deploy.yml@v10"
 check "ref mode v10: envs in contract order" contains "$d/.github/workflows/build.yml" "vars.ENVS || 'dev,staging,prod'"
 
+d="$TMP/ref-pipe"; mkdir -p "$d"
+check "output piped into head still writes all 4 stubs" bash -c '
+  bash "$1" --mode ref --ref v10 --target "$2" | head -1 > /dev/null
+  for f in build deploy update-infrastructure delete-infrastructure; do [ -f "$2/.github/workflows/$f.yml" ] || exit 1; done
+' _ "$INSTALL" "$d"
+
 # ---- 3. vendor mode from a revision name ----------------------------------------
 d="$(new_target vendor old-build)"
 before="$(snapshot "$d")"
