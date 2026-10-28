@@ -1,4 +1,4 @@
-# emergy.cloud workflow contract: astro v9 (shared logic)
+# emergy.cloud workflow contract: astro v10 (shared logic)
 # -----------------------------------------------------------------------------
 # emergy.cloud CI/CD reference - Delete Infrastructure (Astro)
 #
@@ -6,6 +6,9 @@
 # (website buckets, CloudFront distributions, SSR Lambda when present).
 # Manual-only and guarded by an explicit confirmation input. The emergy
 # platform dispatches it (with confirm=confirm) when a project is deleted.
+# Destroying prod needs the same approval as deploying it: when prod is
+# enabled the job runs under the prod GitHub environment (contract v10, HQ
+# decision D15), so a required reviewer of prod approves the destroy.
 #
 # Repository variables maintained by the emergy platform:
 #   PROJECT_ID, AWS_REGION, AWS_ACCOUNT_ID, AWS_INFRA_ROLE_TO_ASSUME,
@@ -19,9 +22,10 @@
 # (.github/workflows/delete-infrastructure.yml) or the confirm input: the
 # emergy platform matches destroy runs by that path and passes that input.
 # -----------------------------------------------------------------------------
-# REUSABLE: every repository calls this file through a thin stub —
-#   uses: emergy-cloud/workflows/.github/workflows/delete-infrastructure.yml@v9
-#   secrets: inherit
+# REUSABLE: each repository calls this file from a thin stub with
+# `secrets: inherit`: by reference at a version tag, or as a vendored copy
+# next to the stub. emergy-cloud/workflows keeps the stub templates
+# (stubs/astro/) and the command that writes both (scripts/install.sh).
 # Triggers, permissions and concurrency live in the calling stub; vars.* and
 # secrets.* resolve in the CALLING repository, and the OIDC token keeps the
 # caller's identity, so the AWS trust policies do not change.
@@ -31,6 +35,11 @@ name: Delete Infrastructure
 on:
   workflow_call:
     inputs:
+      envs:
+        description: "Comma-separated enabled environments - the stub passes its ENVS fallback so the job knows whether prod is enabled"
+        required: false
+        type: string
+        default: ""
       confirm:
         description: "Type 'confirm' to proceed with terraform destroy"
         required: true
@@ -40,6 +49,11 @@ jobs:
   delete:
     # Only run if the caller typed exactly 'confirm'
     if: ${{ inputs.confirm == 'confirm' }}
+
+    # The destroy removes every environment, prod included, so when prod is
+    # enabled the job runs under the prod environment and its protection
+    # rules (required reviewers) gate it. An empty value means no environment.
+    environment: ${{ contains(format(',{0},', inputs.envs || vars.ENVS || 'dev,staging,prod'), ',prod,') && 'prod' || '' }}
 
     runs-on: ubuntu-latest
 

@@ -1,11 +1,13 @@
-# emergy.cloud workflow contract: astro v9 (shared logic)
+# emergy.cloud workflow contract: astro v10 (shared logic)
 # -----------------------------------------------------------------------------
 # emergy.cloud CI/CD reference - Update Infrastructure (Astro)
 #
 # Applies the repository's terraform (infrastructure/) against the project's
 # AWS account: website buckets, CloudFront distributions, and - for SSR
 # templates - the Lambda that serves rendered pages. Runs on pushes to main
-# that touch infrastructure/, or manually. The same file works for every
+# that touch infrastructure/, or manually. When prod is enabled the apply runs
+# under the prod GitHub environment, so a required reviewer of prod approves
+# it (contract v10, HQ decision D15). The same file works for every
 # Astro template - SSR build steps are detected at runtime, and a repo can
 # declare extra terraform-packaged artifacts via an optional
 # website/package.json "prepare:infra" script (run before apply when present).
@@ -27,9 +29,10 @@
 # (.github/workflows/update-infrastructure.yml); the emergy platform matches
 # infrastructure runs by that path.
 # -----------------------------------------------------------------------------
-# REUSABLE: every repository calls this file through a thin stub —
-#   uses: emergy-cloud/workflows/.github/workflows/update-infrastructure.yml@v9
-#   secrets: inherit
+# REUSABLE: each repository calls this file from a thin stub with
+# `secrets: inherit`: by reference at a version tag, or as a vendored copy
+# next to the stub. emergy-cloud/workflows keeps the stub templates
+# (stubs/astro/) and the command that writes both (scripts/install.sh).
 # Triggers, permissions and concurrency live in the calling stub; vars.* and
 # secrets.* resolve in the CALLING repository, and the OIDC token keeps the
 # caller's identity, so the AWS trust policies do not change.
@@ -40,7 +43,7 @@ on:
   workflow_call:
     inputs:
       envs:
-        description: "Comma-separated enabled environments — the stub passes its ENVS fallback so a repository without the variable still behaves like its copy"
+        description: "Comma-separated enabled environments - the stub passes its ENVS fallback so a repository without the variable still behaves like its copy"
         required: false
         type: string
         default: ""
@@ -50,6 +53,12 @@ jobs:
     # Skip the very first push (the commit that creates the repo from the
     # template) - the AWS account is not provisioned yet at that point.
     if: ${{ !(github.event_name == 'push' && github.run_number == 1) }}
+
+    # One apply updates every enabled environment, prod included, so when
+    # prod is enabled the job runs under the prod environment and its
+    # protection rules (required reviewers) gate the apply. An empty value
+    # means no environment.
+    environment: ${{ contains(format(',{0},', inputs.envs || vars.ENVS || 'dev,staging,prod'), ',prod,') && 'prod' || '' }}
 
     runs-on: ubuntu-latest
 

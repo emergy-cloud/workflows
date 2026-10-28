@@ -1,0 +1,64 @@
+# emergy.cloud workflow contract: astro v10
+# -----------------------------------------------------------------------------
+# STUB: the pipeline logic is the reusable workflow named on the `uses:` line
+# of the job below (the shared emergy.cloud workflows at a version tag, or a
+# vendored copy next to this file). This file keeps only what has to sit in
+# the repository: the triggers, permissions, concurrency, the inputs and the
+# ENVS fallback. Generated from the emergy.cloud stub templates; refresh or
+# bump it with the tool that wrote it (the installer or the platform's CI/CD
+# reference), not by hand.
+# CONTRACT - do not rename this file, the run-name, the job id or the inputs:
+# the emergy platform dispatches and parses them.
+# -----------------------------------------------------------------------------
+name: Build
+
+on:
+  # Pushes to any branch build (tags never do). A push to a branch other than
+  # main deploys dev. A push to main (a merge made on GitHub, or on Forgejo
+  # and delivered here by the push mirror) deploys staging; prod then gets
+  # the same artifact, without a rebuild, once a required reviewer of the
+  # prod environment approves it.
+  push:
+    branches: [ "**" ]
+    paths:
+      - "website/**"
+
+  # Pull requests to main build to validate the change; nothing deploys.
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened ]
+
+  # Manual trigger: builds only by default, with optional selected or all
+  # environment deploys.
+  workflow_dispatch:
+    inputs:
+      deploy_all:
+        description: "If true, dispatch Deploy to every enabled environment (ENVS)"
+        required: false
+        default: false
+        type: boolean
+      deploy_environments:
+        description: "Comma-separated environments to deploy after the build"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  id-token: write
+  contents: write
+  actions: write   # dispatches Deploy and reads the environment rules
+
+concurrency:
+  # One run per event, ref and commit: a pull request check never cancels
+  # the push build that deploys the same commit.
+  group: build-${{ github.event_name }}-${{ github.ref }}-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: emergy-cloud/workflows/.github/workflows/build.yml@v10
+    with:
+      envs: ${{ vars.ENVS || 'dev,staging,prod' }}
+      deploy_all: ${{ inputs.deploy_all == true }}
+      deploy_environments: ${{ inputs.deploy_environments || '' }}
+    secrets: inherit

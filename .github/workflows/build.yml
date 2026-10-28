@@ -1,4 +1,4 @@
-# emergy.cloud workflow contract: astro v9 (shared logic)
+# emergy.cloud workflow contract: astro v10 (shared logic)
 # -----------------------------------------------------------------------------
 # emergy.cloud CI/CD reference - Build (Astro)
 #
@@ -22,9 +22,10 @@
 # (environment, sha, deploy_all, deploy_environments); the platform dispatches
 # and parses them.
 # -----------------------------------------------------------------------------
-# REUSABLE: every repository calls this file through a thin stub —
-#   uses: emergy-cloud/workflows/.github/workflows/build.yml@v9
-#   secrets: inherit
+# REUSABLE: each repository calls this file from a thin stub with
+# `secrets: inherit`: by reference at a version tag, or as a vendored copy
+# next to the stub. emergy-cloud/workflows keeps the stub templates
+# (stubs/astro/) and the command that writes both (scripts/install.sh).
 # Triggers, permissions and concurrency live in the calling stub; vars.* and
 # secrets.* resolve in the CALLING repository, and the OIDC token keeps the
 # caller's identity, so the AWS trust policies do not change.
@@ -35,7 +36,7 @@ on:
   workflow_call:
     inputs:
       envs:
-        description: "Comma-separated enabled environments — the stub passes its ENVS fallback so a repository without the variable still behaves like its copy"
+        description: "Comma-separated enabled environments - the stub passes its ENVS fallback so a repository without the variable still behaves like its copy"
         required: false
         type: string
         default: ""
@@ -81,7 +82,8 @@ jobs:
         shell: bash
 
     steps:
-      # ---- Build & upload (every event builds; main's merge commit included) ----
+      # ---- Build & upload (every event builds, main's merge commit included;
+      # a pull request only validates: no AWS role, no upload, no deploy) ----
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -122,8 +124,7 @@ jobs:
 
       - name: Configure AWS credentials (OIDC)
         id: aws_credentials
-        if: >
-          !(github.event_name == 'pull_request' && github.event.action == 'closed')
+        if: github.event_name != 'pull_request'
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ env.ROLE_TO_ASSUME }}
@@ -216,8 +217,7 @@ jobs:
 
       - name: Upload to S3 (artifact bucket, keyed by commit SHA)
         working-directory: ${{ env.WEBSITE_DIR }}
-        if: >
-          !(github.event_name == 'pull_request' && github.event.action == 'closed')
+        if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           # SSR builds keep the raw server bundle out of the public artifact;
@@ -231,34 +231,82 @@ jobs:
             aws s3 cp ./worker.zip "s3://${ARTIFACT_BUCKET}/builds/${COMMIT_SHA}/"
           fi
 
-      # ---- Dispatch Deploy ----
+      # ---- Dispatch Deploy (contract v10: the D15 prod path) ----
       # The pipeline maps git events onto the environment vocabulary:
-      #   push to a feature branch  -> dev
-      #   PR opened/updated to main -> staging
-      #   push to main (a merge)    -> prod (built from the merge commit, whichever host merged it)
-      #   manual run                -> selected envs, every enabled env via deploy_all, or none
+      #   push to a branch other than main -> dev
+      #   push to main (a merge, made on GitHub or on Forgejo and delivered by
+      #     the push mirror)               -> staging; after a successful
+      #     staging deploy, deploy.yml requests prod for the same sha
+      #   push to main, staging disabled   -> prod requested here (same guard)
+      #   pull request to main             -> nothing (the build validates it)
+      #   manual run                       -> selected envs, every enabled env
+      #                                       via deploy_all, or none
       # A target that is not in ENVS is skipped - so projects without a
-      # given environment simply never deploy to it.
+      # given environment simply never deploy to it. A push never deploys
+      # prod by itself: prod is requested only when the repository's prod
+      # environment has a required-reviewers rule, and that run's job waits
+      # for the approval (environment: prod in deploy.yml).
       - name: Dispatch Deploy for this event
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEPLOY_ALL: ${{ inputs.deploy_all }}
           SELECTED_ENVS: ${{ inputs.deploy_environments }}
         run: |
           set -euo pipefail
+          # --- prod promotion guard (keep identical in build.yml and deploy.yml) ---
+          enabled() { [[ ",${ENVS}," == *",$1,"* ]]; }
+          # Ask for <sha> in prod: dispatch Deploy prod on main, whose job runs
+          # under environment: prod and waits for a required reviewer. Skips
+          # (and says why) unless prod is enabled and protected that way.
+          request_prod() {
+            local sha="$1" rules existing
+            if ! enabled prod; then
+              echo "::notice title=No prod promotion::prod is not an enabled environment (ENVS=${ENVS})"
+              return 0
+            fi
+            if ! rules=$(gh api "repos/${REPO}/environments/prod" --jq '[.protection_rules[]?.type] | join(",")' 2>/dev/null); then
+              echo "::warning title=No prod promotion::cannot read the prod environment of ${REPO} (not created yet, or not readable with this token). Create it with required reviewers to get the approval-gated promotion; until then deploy prod by hand."
+              return 0
+            fi
+            if [[ ",${rules}," != *",required_reviewers,"* ]]; then
+              echo "::warning title=No prod promotion::the prod environment of ${REPO} has no required reviewers, so prod is not promoted automatically. Add a required reviewer to enable it; until then deploy prod by hand."
+              return 0
+            fi
+            existing=$(gh api "repos/${REPO}/actions/workflows/deploy.yml/runs?per_page=50" \
+              --jq "[.workflow_runs[] | select(.display_title == \"Deploy prod @ ${sha}\") | select(.status != \"completed\" or .conclusion == \"success\")] | length" 2>/dev/null || echo 0)
+            if [[ "${existing}" != "0" ]]; then
+              echo "A Deploy prod run for ${sha} is already queued, waiting, running or done - no second request"
+              return 0
+            fi
+            echo "Requesting Deploy prod for sha ${sha} (it waits for a required reviewer)"
+            if ! gh api -X POST -H "Accept: application/vnd.github+json" \
+                "repos/${REPO}/actions/workflows/deploy.yml/dispatches" \
+                -f ref=main -f "inputs[environment]=prod" -f "inputs[sha]=${sha}"; then
+              echo "::error title=Prod promotion not requested::the Deploy prod dispatch for ${sha} failed; deploy it to prod by hand"
+            fi
+          }
+          # --- end prod promotion guard ---
           TARGETS=()
-          REF="${{ github.ref_name }}"
-          case "${{ github.event_name }}" in
+          PROMOTE=false
+          REF="${REF_NAME}"
+          case "${EVENT_NAME}" in
             push)
-              if [[ "${{ github.ref_name }}" == "main" ]]; then TARGETS=(prod); REF="main"; else TARGETS=(dev); fi
-              ;;
-            pull_request)
-              if [[ "${{ github.event.pull_request.base.ref }}" == "main" ]]; then
-                TARGETS=(staging)
-                REF="${{ github.event.pull_request.base.ref }}"
+              if [[ "${REF_NAME}" == "main" ]]; then
+                REF="main"
+                if enabled staging; then TARGETS=(staging); else PROMOTE=true; fi
+              else
+                TARGETS=(dev)
               fi
               ;;
+            pull_request)
+              echo "Pull request to ${BASE_REF}: build validated, nothing deployed (the merge to main deploys staging)"
+              ;;
             workflow_dispatch)
-              if [[ "${{ inputs.deploy_all }}" == "true" ]]; then
+              if [[ "${DEPLOY_ALL}" == "true" ]]; then
                 IFS=',' read -ra TARGETS <<< "${ENVS}"
               elif [[ -n "${SELECTED_ENVS}" ]]; then
                 IFS=',' read -ra TARGETS <<< "${SELECTED_ENVS}"
@@ -267,7 +315,7 @@ jobs:
           esac
           for ENV in "${TARGETS[@]:-}"; do
             [ -n "$ENV" ] || continue
-            if [[ ",${ENVS}," != *",${ENV},"* ]]; then
+            if ! enabled "$ENV"; then
               echo "$ENV is not an enabled environment (ENVS=${ENVS}) - skipping deploy"
               continue
             fi
@@ -275,11 +323,15 @@ jobs:
             gh api \
               -X POST \
               -H "Accept: application/vnd.github+json" \
-              "repos/${{ github.repository }}/actions/workflows/deploy.yml/dispatches" \
+              "repos/${REPO}/actions/workflows/deploy.yml/dispatches" \
               -f ref="$REF" \
-              -f inputs[environment]="$ENV" \
-              -f inputs[sha]="${COMMIT_SHA}"
+              -f "inputs[environment]=$ENV" \
+              -f "inputs[sha]=${COMMIT_SHA}"
           done
+          if [[ "${PROMOTE}" == "true" ]]; then
+            echo "staging is not enabled (ENVS=${ENVS}): main goes to prod through the approval-gated promotion"
+            request_prod "${COMMIT_SHA}"
+          fi
 
       # ---- Forgejo commit status (optional, see FORGEJO_* above) ----
       - name: Report the result to Forgejo

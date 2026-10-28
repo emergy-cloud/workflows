@@ -1,0 +1,36 @@
+# emergy.cloud workflow contract: astro v10
+# -----------------------------------------------------------------------------
+# STUB: the pipeline logic is the reusable workflow named on the `uses:` line
+# of the job below (the shared emergy.cloud workflows at a version tag, or a
+# vendored copy next to this file). This file keeps only what has to sit in
+# the repository: the triggers, permissions, concurrency, the inputs and the
+# ENVS fallback. Generated from the emergy.cloud stub templates; refresh or
+# bump it with the tool that wrote it (the installer or the platform's CI/CD
+# reference), not by hand.
+# CONTRACT - do not rename this file, the run-name, the job id or the inputs:
+# the emergy platform dispatches and parses them.
+# -----------------------------------------------------------------------------
+name: Delete Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type 'confirm' to proceed with terraform destroy"
+        required: true
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  delete:
+    # Only run if the caller typed exactly 'confirm' (the reusable workflow checks it again)
+    if: ${{ inputs.confirm == 'confirm' }}
+    uses: emergy-cloud/workflows/.github/workflows/delete-infrastructure.yml@v10
+    with:
+      envs: ${{ vars.ENVS || 'dev,staging,prod' }}
+      confirm: ${{ inputs.confirm }}
+    secrets: inherit
