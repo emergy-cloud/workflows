@@ -1,0 +1,31 @@
+# emergy.cloud workflow contract: astro v10
+# -----------------------------------------------------------------------------
+# STUB: the pipeline logic is the reusable workflow named on the `uses:` line
+# of the job below (the shared emergy.cloud workflows at a version tag, or a
+# vendored copy next to this file). This file keeps only what has to sit in
+# the repository: the triggers, permissions, concurrency, the inputs and the
+# ENVS fallback. Generated from the emergy.cloud stub templates; refresh or
+# bump it with the tool that wrote it (the installer or the platform's CI/CD
+# reference), not by hand.
+# CONTRACT - do not rename this file, the run-name, the job id or the inputs:
+# the emergy platform dispatches and parses them.
+# -----------------------------------------------------------------------------
+name: Update Infrastructure
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ main ]
+    paths: [ "infrastructure/**" ]
+
+permissions:
+  id-token: write
+  contents: read
+  deployments: write
+
+jobs:
+  update:
+    uses: emergy-cloud/workflows/.github/workflows/update-infrastructure.yml@v10
+    with:
+      envs: ${{ vars.ENVS || 'dev,staging,prod' }}
+    secrets: inherit

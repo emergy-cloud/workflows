@@ -1,4 +1,4 @@
-# emergy.cloud workflow contract: astro v9 (shared logic)
+# emergy.cloud workflow contract: astro v10 (shared logic)
 # -----------------------------------------------------------------------------
 # emergy.cloud CI/CD reference - Deploy (Astro)
 #
@@ -8,6 +8,12 @@
 # artifact ships a server bundle, updates an optional control-plane worker,
 # and invalidates the CloudFront cache. The same file works for every Astro
 # template - artifacts are detected, not hardcoded.
+#
+# The job runs under the GitHub environment it deploys (environment: <name>),
+# so that environment's protection rules apply. After a successful staging
+# deploy of a commit on main it requests the same artifact for prod; the prod
+# run waits for a required reviewer of the prod environment (contract v10,
+# HQ decision D15). See README.md, "The prod path".
 #
 # Repository variables maintained by the emergy platform:
 #   PROJECT_ID, AWS_REGION, AWS_ACCOUNT_ID, AWS_INFRA_ROLE_TO_ASSUME, ENVS
@@ -23,9 +29,10 @@
 # platform dispatches this workflow and parses those names to link runs to
 # environments.
 # -----------------------------------------------------------------------------
-# REUSABLE: every repository calls this file through a thin stub —
-#   uses: emergy-cloud/workflows/.github/workflows/deploy.yml@v9
-#   secrets: inherit
+# REUSABLE: each repository calls this file from a thin stub with
+# `secrets: inherit`: by reference at a version tag, or as a vendored copy
+# next to the stub. emergy-cloud/workflows keeps the stub templates
+# (stubs/astro/) and the command that writes both (scripts/install.sh).
 # Triggers, permissions and concurrency live in the calling stub; vars.* and
 # secrets.* resolve in the CALLING repository, and the OIDC token keeps the
 # caller's identity, so the AWS trust policies do not change.
@@ -36,7 +43,7 @@ on:
   workflow_call:
     inputs:
       envs:
-        description: "Comma-separated enabled environments — the stub passes its ENVS fallback so a repository without the variable still behaves like its copy"
+        description: "Comma-separated enabled environments - the stub passes its ENVS fallback so a repository without the variable still behaves like its copy"
         required: false
         type: string
         default: ""
@@ -238,3 +245,70 @@ jobs:
           aws cloudfront create-invalidation \
             --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
             --paths "/*"
+
+      # ---- Prod promotion (contract v10: the D15 prod path) ----
+      # After a successful staging deploy of a commit on main, ask for the
+      # same artifact in prod: dispatch Deploy prod with the same sha (no
+      # rebuild). That run's job declares environment: prod (above), so GitHub
+      # holds it until a required reviewer approves. Requested only when prod
+      # is enabled and the prod environment has a required-reviewers rule;
+      # otherwise the run says why and nothing reaches prod. A failed request
+      # is an error annotation and does not fail this staging deploy, which
+      # did succeed.
+      - name: Request prod promotion (needs approval)
+        if: inputs.environment == 'staging'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          # --- prod promotion guard (keep identical in build.yml and deploy.yml) ---
+          enabled() { [[ ",${ENVS}," == *",$1,"* ]]; }
+          # Ask for <sha> in prod: dispatch Deploy prod on main, whose job runs
+          # under environment: prod and waits for a required reviewer. Skips
+          # (and says why) unless prod is enabled and protected that way.
+          request_prod() {
+            local sha="$1" rules existing
+            if ! enabled prod; then
+              echo "::notice title=No prod promotion::prod is not an enabled environment (ENVS=${ENVS})"
+              return 0
+            fi
+            if ! rules=$(gh api "repos/${REPO}/environments/prod" --jq '[.protection_rules[]?.type] | join(",")' 2>/dev/null); then
+              echo "::warning title=No prod promotion::cannot read the prod environment of ${REPO} (not created yet, or not readable with this token). Create it with required reviewers to get the approval-gated promotion; until then deploy prod by hand."
+              return 0
+            fi
+            if [[ ",${rules}," != *",required_reviewers,"* ]]; then
+              echo "::warning title=No prod promotion::the prod environment of ${REPO} has no required reviewers, so prod is not promoted automatically. Add a required reviewer to enable it; until then deploy prod by hand."
+              return 0
+            fi
+            existing=$(gh api "repos/${REPO}/actions/workflows/deploy.yml/runs?per_page=50" \
+              --jq "[.workflow_runs[] | select(.display_title == \"Deploy prod @ ${sha}\") | select(.status != \"completed\" or .conclusion == \"success\")] | length" 2>/dev/null || echo 0)
+            if [[ "${existing}" != "0" ]]; then
+              echo "A Deploy prod run for ${sha} is already queued, waiting, running or done - no second request"
+              return 0
+            fi
+            echo "Requesting Deploy prod for sha ${sha} (it waits for a required reviewer)"
+            if ! gh api -X POST -H "Accept: application/vnd.github+json" \
+                "repos/${REPO}/actions/workflows/deploy.yml/dispatches" \
+                -f ref=main -f "inputs[environment]=prod" -f "inputs[sha]=${sha}"; then
+              echo "::error title=Prod promotion not requested::the Deploy prod dispatch for ${sha} failed; deploy it to prod by hand"
+            fi
+          }
+          # --- end prod promotion guard ---
+          # "Built from main": this run was dispatched on main AND the sha is
+          # on main's history (a staging redeploy of a branch build is not).
+          if [[ ! "${COMMIT_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::notice title=No prod promotion::'${COMMIT_SHA}' is not a full commit sha"
+            exit 0
+          fi
+          if [[ "${RUN_REF}" != "refs/heads/main" ]]; then
+            echo "::notice title=No prod promotion::this staging deploy ran from ${RUN_REF}, not main"
+            exit 0
+          fi
+          ON_MAIN=$(gh api "repos/${REPO}/compare/${COMMIT_SHA}...main?per_page=1" --jq .status 2>/dev/null || echo unknown)
+          if [[ "${ON_MAIN}" != "identical" && "${ON_MAIN}" != "ahead" ]]; then
+            echo "::notice title=No prod promotion::${COMMIT_SHA} is not on main (compare status: ${ON_MAIN})"
+            exit 0
+          fi
+          request_prod "${COMMIT_SHA}"

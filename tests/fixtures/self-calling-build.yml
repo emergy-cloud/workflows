@@ -1,0 +1,37 @@
+# emergy.cloud workflow contract: astro v10 (shared logic)
+# -----------------------------------------------------------------------------
+# FIXTURE for tests/contract-check.test.sh: the shape commit d372cff left in
+# .github/workflows/build.yml (a reusable workflow whose only job calls the
+# shared build.yml, that is itself), brought to v10. scripts/contract-check.sh
+# must reject it: no runs-on, and a job that calls a workflow of this
+# repository. Never copy this file into .github/workflows.
+# -----------------------------------------------------------------------------
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      envs:
+        description: "Comma-separated enabled environments - the stub passes its ENVS fallback so a repository without the variable still behaves like its copy"
+        required: false
+        type: string
+        default: ""
+      deploy_all:
+        description: "If true, dispatch Deploy to every enabled environment (ENVS)"
+        required: false
+        type: boolean
+        default: false
+      deploy_environments:
+        description: "Comma-separated environments to deploy after the build"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  build:
+    uses: emergy-cloud/workflows/.github/workflows/build.yml@v10
+    with:
+      envs: ${{ inputs.envs || vars.ENVS || 'dev,staging,prod' }}
+      deploy_all: ${{ inputs.deploy_all == true }}
+      deploy_environments: ${{ inputs.deploy_environments || '' }}
+    secrets: inherit
