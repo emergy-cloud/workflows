@@ -181,6 +181,16 @@ jobs:
             aws s3 rm "${TARGET}/${E}_robots.txt" --only-show-errors || true
           done
 
+          # A static site's /version (dvk-common lego version-endpoint). It has no
+          # extension, so S3 calls it binary, and every build's has the same size,
+          # so the sync skips it when an older build is promoted or rolled back.
+          if aws s3api head-object \
+               --bucket "${ARTIFACT_BUCKET}" \
+               --key "builds/${COMMIT_SHA}/${{ steps.layout.outputs.prefix }}version" >/dev/null 2>&1; then
+            aws s3 cp "${SRC}version" "${TARGET}/version" --only-show-errors \
+              --content-type application/json --cache-control no-store --metadata-directive REPLACE
+          fi
+
       - name: Update SSR Lambda
         if: steps.layout.outputs.ssr == 'true'
         run: |
