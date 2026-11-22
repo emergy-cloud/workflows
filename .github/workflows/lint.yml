@@ -41,6 +41,9 @@ jobs:
       - name: prod path tests (the v10 dispatch and promotion scripts, fake gh)
         run: bash tests/prod-path.test.sh
 
+      - name: static /version tests (the deploy sync script, fake aws)
+        run: bash tests/static-version.test.sh
+
       - name: install.sh tests (reference and vendored output, actionlinted)
         env:
           ACTIONLINT: ${{ github.workspace }}/actionlint
