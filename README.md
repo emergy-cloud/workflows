@@ -128,7 +128,7 @@ scripts/install.sh --mode vendor --ref v10.0.0 --target /repos/app.upmatch.io
   review `git diff`, commit.
 
 The emergy.cloud platform serves the same stubs in reference mode from its
-CI/CD reference (`curl -fsSL 'https://emergy.cloud/api/workflows.sh?envs=dev,prod' | sh`);
+CI/CD reference (`curl -fsSL 'https://www.emergy.cloud/api/workflows.sh?envs=dev,prod' | sh`);
 it syncs them from `stubs/astro/` here (`website/scripts/sync-workflow-stubs.mjs`
 in www.emergy.cloud) and records the source sha.
 
